@@ -1,7 +1,6 @@
 ﻿import streamlit as st
 import pandas as pd
 import numpy as np
-import os
 import re
 from rapidfuzz import process, fuzz
 
@@ -10,10 +9,6 @@ from rapidfuzz import process, fuzz
 # ------------------------------------------------
 st.set_page_config(layout="wide")
 st.title("Agency Coverage & Rate Card Intelligence")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COVERAGE_FILE = os.path.join(BASE_DIR, "coverage.csv")
-RATE_FILE = os.path.join(BASE_DIR, "rate_cards.csv")
 
 FUZZY_THRESHOLD = 85
 
@@ -29,7 +24,7 @@ def clean_name(val):
     return val
 
 def fuzzy_match(name, choices):
-    if not name or not choices:
+    if not name or len(choices) == 0:
         return None
     match = process.extractOne(name, choices, scorer=fuzz.ratio)
     if match and match[1] >= FUZZY_THRESHOLD:
@@ -37,58 +32,96 @@ def fuzzy_match(name, choices):
     return None
 
 # ------------------------------------------------
-# Load data
+# Sidebar Uploads
 # ------------------------------------------------
-@st.cache_data
-def load_data():
-    coverage = pd.read_csv(COVERAGE_FILE)
-    rate = pd.read_csv(RATE_FILE)
+st.sidebar.header("📂 Upload Data Files")
 
-    coverage["agency_clean"] = coverage["agency_name"].apply(clean_name)
-    coverage["city_clean"] = coverage["city"].apply(clean_name)
+agency_file = st.sidebar.file_uploader(
+    "Upload Agency Coverage CSV",
+    type=["csv"],
+    key="agency_csv"
+)
 
-    rate["agency_clean"] = rate["agency_name"].apply(clean_name)
-    rate["city_clean"] = rate["venue_city"].apply(clean_name)
+ratecard_file = st.sidebar.file_uploader(
+    "Upload Rate Card CSV",
+    type=["csv"],
+    key="ratecard_csv"
+)
 
-    return coverage, rate
-
-coverage, rate_cards = load_data()
+if agency_file is None or ratecard_file is None:
+    st.info("Please upload both CSV files to begin.")
+    st.stop()
 
 # ------------------------------------------------
-# Fuzzy agency alignment (rate → coverage)
+# Load Data
 # ------------------------------------------------
-coverage_agencies = coverage["agency_clean"].dropna().unique().tolist()
-rate_cards["coverage_agency_clean"] = rate_cards["agency_clean"].apply(
+agency_df = pd.read_csv(agency_file)
+ratecard_df = pd.read_csv(ratecard_file)
+
+# ------------------------------------------------
+# Clean & prepare names for fuzzy matching
+# ------------------------------------------------
+agency_df["agency_clean"] = agency_df["agency_name"].apply(clean_name)
+agency_df["city_clean"] = agency_df["city"].apply(clean_name)
+
+ratecard_df["agency_clean"] = ratecard_df["agency_name"].apply(clean_name)
+ratecard_df["city_clean"] = ratecard_df["venue_city"].apply(clean_name)
+
+# Ensure margins are numeric and drop empty
+ratecard_df["agency_margin"] = pd.to_numeric(ratecard_df.get("agency_margin", np.nan), errors="coerce")
+ratecard_df = ratecard_df.dropna(subset=["agency_margin"])
+
+# ------------------------------------------------
+# Fuzzy matching: agency names
+# ------------------------------------------------
+coverage_agencies = agency_df["agency_clean"].dropna().unique().tolist()
+ratecard_df["coverage_agency_clean"] = ratecard_df["agency_clean"].apply(
     lambda x: fuzzy_match(x, coverage_agencies)
+)
+
+# ------------------------------------------------
+# Fuzzy matching: city names
+# ------------------------------------------------
+coverage_cities = agency_df["city_clean"].dropna().unique().tolist()
+ratecard_df["coverage_city_clean"] = ratecard_df["city_clean"].apply(
+    lambda x: fuzzy_match(x, coverage_cities)
 )
 
 # ------------------------------------------------
 # Build agency × city spine (union)
 # ------------------------------------------------
 rate_pairs = (
-    rate_cards[["agency_name", "agency_clean", "city_clean", "venue_city"]]
-    .dropna(subset=["agency_name", "venue_city"])
-    .rename(columns={"venue_city": "city"})
+    ratecard_df[["agency_name", "agency_clean", "coverage_city_clean", "venue_city", "platforms.employer_id"]]
+    .dropna(subset=["agency_name", "coverage_city_clean"])
+    .rename(columns={"coverage_city_clean": "city_clean", "venue_city": "city"})
 )
+
 coverage_pairs = (
-    coverage[["agency_name", "agency_clean", "city_clean", "city"]]
+    agency_df[["agency_name", "agency_clean", "city_clean", "city"]]
     .dropna(subset=["agency_name", "city"])
 )
-agency_city_spine = pd.concat([rate_pairs, coverage_pairs], ignore_index=True)
-agency_city_spine = agency_city_spine.drop_duplicates(subset=["agency_clean", "city_clean"])
+
+agency_city_spine = (
+    pd.concat([rate_pairs, coverage_pairs], ignore_index=True)
+    .drop_duplicates(subset=["agency_clean", "city_clean"])
+)
 
 # ------------------------------------------------
-# Attach rate cards and coverage
+# Attach rate cards
 # ------------------------------------------------
 spine_rates = agency_city_spine.merge(
-    rate_cards,
+    ratecard_df,
     how="left",
     left_on=["agency_clean", "city_clean"],
     right_on=["agency_clean", "city_clean"],
     suffixes=("", "_rate")
 )
+
+# ------------------------------------------------
+# Attach coverage
+# ------------------------------------------------
 final = spine_rates.merge(
-    coverage,
+    agency_df,
     how="left",
     left_on=["agency_clean", "city_clean"],
     right_on=["agency_clean", "city_clean"],
@@ -100,9 +133,9 @@ final = spine_rates.merge(
 # ------------------------------------------------
 final["presence_type"] = np.select(
     [
-        final["agency_margin"].notna() & final["role_category"].notna(),
+        final["agency_margin"].notna() & final.get("role_category").notna(),
         final["agency_margin"].notna(),
-        final["role_category"].notna(),
+        final.get("role_category").notna(),
     ],
     [
         "Rate Card + Coverage",
@@ -115,33 +148,41 @@ final["presence_type"] = np.select(
 # ------------------------------------------------
 # City averages
 # ------------------------------------------------
-city_avg = final.groupby("city", as_index=False)["agency_margin"].mean().rename(
-    columns={"agency_margin": "city_avg_margin"}
+city_avg = (
+    final.groupby("city", as_index=False)["agency_margin"]
+    .mean()
+    .rename(columns={"agency_margin": "city_avg_margin"})
 )
+
 final = final.merge(city_avg, on="city", how="left")
 final["margin_vs_city_avg"] = final["agency_margin"] - final["city_avg_margin"]
 
 # ------------------------------------------------
-# Sidebar
+# Sidebar Filters
 # ------------------------------------------------
 st.sidebar.header("View")
 view = st.sidebar.radio(
     "Mode",
-    ["Coverage View", "Agency View", "City View"]
+    ["Coverage View", "Agency View", "City View", "Client View"]
 )
 
 st.sidebar.header("Filters")
 cities = sorted(final["city"].dropna().unique())
 agencies = sorted(final["agency_name"].dropna().unique())
+clients = sorted(final["platforms.employer_id"].dropna().unique()) if "platforms.employer_id" in final.columns else []
 
-selected_city = st.sidebar.selectbox("City", ["All"] + cities)
-selected_agency = st.sidebar.selectbox("Agency", ["All"] + agencies)
+selected_city = st.sidebar.multiselect("City", ["All"] + cities, default=["All"])
+selected_agency = st.sidebar.multiselect("Agency", ["All"] + agencies, default=["All"])
+selected_client = st.sidebar.selectbox("Client", ["All"] + clients)
 
 df = final.copy()
-if selected_city != "All":
-    df = df[df["city"] == selected_city]
-if selected_agency != "All":
-    df = df[df["agency_name"] == selected_agency]
+
+if "All" not in selected_city:
+    df = df[df["city"].isin(selected_city)]
+if "All" not in selected_agency:
+    df = df[df["agency_name"].isin(selected_agency)]
+if selected_client != "All":
+    df = df[df["platforms.employer_id"] == selected_client]
 
 # =================================================
 # COVERAGE VIEW
@@ -171,47 +212,84 @@ if view == "Coverage View":
 # =================================================
 elif view == "Agency View":
     st.subheader("Agency Performance")
-    if selected_agency == "All":
-        st.warning("Select a specific agency.")
+    if len(selected_agency) != 1 or selected_agency[0] == "All":
+        st.warning("Select a single specific agency to view Agency View.")
     else:
-        a = df[df["agency_name"] == selected_agency]
+        agency_name = selected_agency[0]
+        a = df[df["agency_name"] == agency_name]
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Cities (Any Presence)", a["city"].nunique())
         c2.metric("Cities w/ Rate Cards", a[a["agency_margin"].notna()]["city"].nunique())
-        c3.metric("Avg Margin", round(a["agency_margin"].mean(), 2))
-        c4.metric("Avg vs City", round(a["margin_vs_city_avg"].mean(), 2))
+        c3.metric("Avg Margin", round(a["agency_margin"].mean(), 2) if not a["agency_margin"].empty else "N/A")
+        c4.metric("Avg vs City", round(a["margin_vs_city_avg"].mean(), 2) if not a["margin_vs_city_avg"].empty else "N/A")
 
         st.markdown("### City Breakdown")
-        city_tbl = a.groupby("city", as_index=False).agg(
-            presence=("presence_type", lambda x: ", ".join(sorted(set(x)))),
-            avg_margin=("agency_margin", "mean"),
-            city_avg=("city_avg_margin", "mean")
+        city_tbl = (
+            a.groupby("city", as_index=False)
+            .agg(
+                presence=("presence_type", lambda x: ", ".join(sorted(set(x)))),
+                avg_margin=("agency_margin", "mean"),
+                city_avg=("city_avg_margin", "mean")
+            )
         )
         city_tbl["delta"] = city_tbl["avg_margin"] - city_tbl["city_avg"]
-        st.dataframe(city_tbl.sort_values("delta", ascending=False), use_container_width=True)
+        st.dataframe(
+            city_tbl.sort_values("delta", ascending=False),
+            use_container_width=True
+        )
 
 # =================================================
 # CITY VIEW
 # =================================================
 elif view == "City View":
     st.subheader("City Market View")
-    if selected_city == "All":
-        st.warning("Select a city.")
+    if len(selected_city) != 1 or selected_city[0] == "All":
+        st.warning("Select a single city to view City View.")
     else:
-        c = df[df["city"] == selected_city]
+        city_name = selected_city[0]
+        c = df[df["city"] == city_name]
+
         c1, c2, c3 = st.columns(3)
         c1.metric("Agencies", c["agency_name"].nunique())
         c2.metric("Coverage Only", (c["presence_type"] == "Coverage Only").sum())
-        c3.metric("City Avg Margin", round(c["agency_margin"].mean(), 2))
+        city_avg_val = c["agency_margin"].dropna()
+        c3.metric("City Avg Margin", round(city_avg_val.mean(), 2) if not city_avg_val.empty else "N/A")
 
         st.markdown("### Agencies in City")
-        rank = c.groupby("agency_name", as_index=False).agg(
-            presence=("presence_type", lambda x: ", ".join(sorted(set(x)))),
-            avg_margin=("agency_margin", "mean"),
-            venues=("venue_name", "nunique")
+        rank = (
+            c.groupby("agency_name", as_index=False)
+            .agg(
+                presence=("presence_type", lambda x: ", ".join(sorted(set(x)))),
+                avg_margin=("agency_margin", "mean"),
+                venues=("venue_name", "nunique")
+            )
         )
         rank["rank"] = rank["avg_margin"].rank(method="dense", ascending=False)
-        st.dataframe(rank.sort_values("rank"), use_container_width=True)
+        st.dataframe(
+            rank.sort_values("rank"),
+            use_container_width=True
+        )
+
+# =================================================
+# CLIENT VIEW
+# =================================================
+elif view == "Client View":
+    st.subheader("Client View")
+    if selected_client == "All":
+        st.warning("Select a specific client to view Client View.")
+    else:
+        client_df = df[df["platforms.employer_id"] == selected_client]
+        if client_df.empty:
+            st.info("No data for this client with current filters.")
+        else:
+            pivot = client_df.pivot_table(
+                index="city",
+                columns="agency_name",
+                values="agency_margin",
+                aggfunc="mean"
+            )
+            st.dataframe(pivot.fillna("-"), use_container_width=True)
 
 # ------------------------------------------------
 # Export

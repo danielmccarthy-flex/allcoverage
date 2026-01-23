@@ -1,3 +1,0 @@
-([('agency_dashboard',
-   '/Users/daniel.mccarthy/Desktop/allcoverage/dist/agency_dashboard',
-   'EXECUTABLE')],)
