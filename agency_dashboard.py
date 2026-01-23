@@ -32,21 +32,19 @@ def fuzzy_match(name, choices):
     return None
 
 # ------------------------------------------------
+# Cached CSV loader
+# ------------------------------------------------
+@st.cache_data
+def load_csv(file):
+    return pd.read_csv(file)
+
+# ------------------------------------------------
 # Sidebar Uploads
 # ------------------------------------------------
 st.sidebar.header("📂 Upload Data Files")
 
-agency_file = st.sidebar.file_uploader(
-    "Upload Agency Coverage CSV",
-    type=["csv"],
-    key="agency_csv"
-)
-
-ratecard_file = st.sidebar.file_uploader(
-    "Upload Rate Card CSV",
-    type=["csv"],
-    key="ratecard_csv"
-)
+agency_file = st.sidebar.file_uploader("Upload Agency Coverage CSV", type=["csv"], key="agency_csv")
+ratecard_file = st.sidebar.file_uploader("Upload Rate Card CSV", type=["csv"], key="ratecard_csv")
 
 if agency_file is None or ratecard_file is None:
     st.info("Please upload both CSV files to begin.")
@@ -55,8 +53,42 @@ if agency_file is None or ratecard_file is None:
 # ------------------------------------------------
 # Load Data
 # ------------------------------------------------
-agency_df = pd.read_csv(agency_file)
-ratecard_df = pd.read_csv(ratecard_file)
+agency_df = load_csv(agency_file)
+ratecard_df = load_csv(ratecard_file)
+
+# ------------------------------------------------
+# Required Columns Check
+# ------------------------------------------------
+required_agency_cols = ["agency_name", "city"]
+missing_agency = [c for c in required_agency_cols if c not in agency_df.columns]
+
+required_ratecard_cols = ["agency_name", "venue_city", "agency_margin"]
+missing_ratecard = [c for c in required_ratecard_cols if c not in ratecard_df.columns]
+
+if missing_agency:
+    st.error(f"Missing columns in Agency Coverage CSV: {missing_agency}")
+    st.stop()
+if missing_ratecard:
+    st.error(f"Missing columns in Rate Card CSV: {missing_ratecard}")
+    st.stop()
+
+# ------------------------------------------------
+# Handle optional columns
+# ------------------------------------------------
+if "role_category" not in agency_df.columns:
+    agency_df["role_category"] = np.nan
+if "supply_capability" not in agency_df.columns:
+    agency_df["supply_capability"] = np.nan
+
+# Map employer_id to platforms.employer_id if needed
+if "platforms.employer_id" not in ratecard_df.columns and "employer_id" in ratecard_df.columns:
+    ratecard_df["platforms.employer_id"] = ratecard_df["employer_id"]
+elif "platforms.employer_id" not in ratecard_df.columns:
+    ratecard_df["platforms.employer_id"] = np.nan
+
+# Ensure margins are numeric and drop empty
+ratecard_df["agency_margin"] = pd.to_numeric(ratecard_df.get("agency_margin", np.nan), errors="coerce")
+ratecard_df = ratecard_df.dropna(subset=["agency_margin"])
 
 # ------------------------------------------------
 # Clean & prepare names for fuzzy matching
@@ -66,10 +98,6 @@ agency_df["city_clean"] = agency_df["city"].apply(clean_name)
 
 ratecard_df["agency_clean"] = ratecard_df["agency_name"].apply(clean_name)
 ratecard_df["city_clean"] = ratecard_df["venue_city"].apply(clean_name)
-
-# Ensure margins are numeric and drop empty
-ratecard_df["agency_margin"] = pd.to_numeric(ratecard_df.get("agency_margin", np.nan), errors="coerce")
-ratecard_df = ratecard_df.dropna(subset=["agency_margin"])
 
 # ------------------------------------------------
 # Fuzzy matching: agency names
@@ -161,22 +189,18 @@ final["margin_vs_city_avg"] = final["agency_margin"] - final["city_avg_margin"]
 # Sidebar Filters
 # ------------------------------------------------
 st.sidebar.header("View")
-view = st.sidebar.radio(
-    "Mode",
-    ["Coverage View", "Agency View", "City View", "Client View"]
-)
+view = st.sidebar.radio("Mode", ["Coverage View", "Agency View", "City View", "Client View"])
 
 st.sidebar.header("Filters")
 cities = sorted(final["city"].dropna().unique())
 agencies = sorted(final["agency_name"].dropna().unique())
-clients = sorted(final["platforms.employer_id"].dropna().unique()) if "platforms.employer_id" in final.columns else []
+clients = sorted(final["platforms.employer_id"].dropna().unique())
 
 selected_city = st.sidebar.multiselect("City", ["All"] + cities, default=["All"])
 selected_agency = st.sidebar.multiselect("Agency", ["All"] + agencies, default=["All"])
 selected_client = st.sidebar.selectbox("Client", ["All"] + clients)
 
 df = final.copy()
-
 if "All" not in selected_city:
     df = df[df["city"].isin(selected_city)]
 if "All" not in selected_agency:
@@ -262,10 +286,11 @@ elif view == "City View":
             .agg(
                 presence=("presence_type", lambda x: ", ".join(sorted(set(x)))),
                 avg_margin=("agency_margin", "mean"),
-                venues=("venue_name", "nunique")
+                venues=("venue_name", "nunique") if "venue_name" in c.columns else pd.Series(np.nan)
             )
         )
-        rank["rank"] = rank["avg_margin"].rank(method="dense", ascending=False)
+        if "rank" not in rank.columns:
+            rank["rank"] = rank["avg_margin"].rank(method="dense", ascending=False)
         st.dataframe(
             rank.sort_values("rank"),
             use_container_width=True
