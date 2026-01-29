@@ -10,7 +10,7 @@ from rapidfuzz import process, fuzz
 st.set_page_config(layout="wide")
 st.title("Agency Coverage & Rate Card Intelligence")
 
-FUZZY_THRESHOLD = 85
+FUZZY_THRESHOLD = 80
 
 # ------------------------------------------------
 # Helpers
@@ -19,15 +19,20 @@ def clean_name(val):
     if pd.isna(val):
         return ""
     val = val.lower()
-    val = re.sub(r"[^a-z0-9 ]", "", val)
-    val = re.sub(r"\s+", "", val)
+    # Remove "dba", "inc", "llc", "solutions" to help focus on the core name
+    noise_words = [r"\binc\b", r"\bllc\b", r"\bdba\b", r"\bsolutions\b", r"\bstaffing\b"]
+    for word in noise_words:
+        val = re.sub(word, "", val)
+    val = re.sub(r"[^a-z0-9 ]", "", val) # Keep spaces for token matching
+    val = re.sub(r"\s+", " ", val).strip()
     return val
 
 def fuzzy_match(name, choices):
     if not name or len(choices) == 0:
         return None
-    match = process.extractOne(name, choices, scorer=fuzz.ratio)
-    if match and match[1] >= FUZZY_THRESHOLD:
+    # partial_token_set_ratio is the "heavy hitter" for substrings and noise
+    match = process.extractOne(name, choices, scorer=fuzz.partial_token_set_ratio)
+    if match and match[1] >= 75: # Lowering slightly to catch more
         return match[0]
     return None
 
@@ -213,6 +218,23 @@ if selected_client != "All":
 # =================================================
 if view == "Coverage View":
     st.subheader("Market Coverage Overview")
+    
+    # Define how to combine the data for each agency/city group
+    aggregation_logic = {
+        "presence_type": lambda x: ", ".join(sorted(set(x))),
+        "agency_margin": "mean",
+        "city_avg_margin": "mean",
+        "margin_vs_city_avg": "mean",
+        "role_category": lambda x: ", ".join([str(i) for i in sorted(set(x)) if pd.notna(i)]),
+        "supply_capability": lambda x: ", ".join([str(i) for i in sorted(set(x)) if pd.notna(i)])
+    }
+
+    # Group by Agency and City, then apply the logic
+    df_grouped = (
+        df.groupby(["agency_name", "city"], as_index=False)
+        .agg(aggregation_logic)
+    )
+
     cols = [
         "agency_name",
         "city",
@@ -223,8 +245,9 @@ if view == "Coverage View":
         "role_category",
         "supply_capability"
     ]
+
     st.dataframe(
-        df[cols].sort_values(
+        df_grouped[cols].sort_values(
             ["city", "presence_type", "agency_margin"],
             ascending=[True, True, False]
         ),
