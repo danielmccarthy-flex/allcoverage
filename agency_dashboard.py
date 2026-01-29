@@ -26,7 +26,7 @@ NAME_OVERRIDES = {
 }
 
 # ------------------------------------------------
-# 2. Unification Logic
+# 2. Helpers
 # ------------------------------------------------
 def unify_agency_names(names_list):
     def get_clean_key(s):
@@ -52,160 +52,173 @@ def unify_agency_names(names_list):
                 
     return master_map
 
+def clean_numeric(x):
+    if pd.isna(x): return np.nan
+    s = str(x).replace('%', '').replace(',', '').strip()
+    try:
+        return float(s)
+    except:
+        return np.nan
+
 @st.cache_data
-def load_csv(file):
-    return pd.read_csv(file)
+def load_csv_safe(file):
+    """Detects encoding and delimiter automatically."""
+    try:
+        return pd.read_csv(file)
+    except UnicodeDecodeError:
+        file.seek(0)
+        return pd.read_csv(file, sep='\t', encoding='utf-16')
+    except Exception:
+        file.seek(0)
+        return pd.read_csv(file, sep=None, engine='python')
 
 # ------------------------------------------------
-# 3. Data Loading & Standardization
+# 3. Multi-File Upload & Data Sorting
 # ------------------------------------------------
-st.sidebar.header("📂 Upload Data Files")
-agency_file = st.sidebar.file_uploader("Upload Agency Coverage CSV", type=["csv"], key="agency_csv")
-ratecard_file = st.sidebar.file_uploader("Upload Rate Card CSV", type=["csv"], key="ratecard_csv")
+st.sidebar.header("📂 Data Upload")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload Agency, Rate Card, and Scorecard files together", 
+    type=["csv", "txt"], 
+    accept_multiple_files=True
+)
 
-if agency_file is None or ratecard_file is None:
-    st.info("Please upload both CSV files to begin.")
+a_df, r_df, s_df = None, None, None
+
+if uploaded_files:
+    for file in uploaded_files:
+        temp_df = load_csv_safe(file)
+        cols = [c.lower() for c in temp_df.columns]
+        
+        if "supply_capability" in cols or "role_category" in cols:
+            a_df = temp_df
+        elif "agency_margin" in cols:
+            r_df = temp_df
+        elif "fulfilled%" in cols or "agency_worker_requested" in cols:
+            s_df = temp_df
+
+if a_df is None or r_df is None or s_df is None:
+    st.info("Please upload all three files (Agency Coverage, Rate Card, and Scorecard) to continue.")
     st.stop()
-
-a_df = load_csv(agency_file)
-r_df = load_csv(ratecard_file)
 
 def standardize_columns(df):
     df.columns = [c.lower().strip().replace(" ", "_") for c in df.columns]
     mapping = {
         'brand': 'agency_name', 'vendor': 'agency_name', 'agency': 'agency_name',
         'venue_city': 'city', 'location': 'city', 'market': 'city',
-        'employer_id': 'platforms.employer_id', 'venue': 'venue_name'
+        'employer_id': 'platforms.employer_id', 'venue': 'venue_name',
+        'employer_name': 'client_name', 'fulfilled%': 'fulfilled_val',
+        'agency_worker_requested': 'shifts_requested', 
+        'actual_agency_worker_provided': 'shifts_filled'
     }
     return df.rename(columns=mapping)
 
 a_df = standardize_columns(a_df)
 r_df = standardize_columns(r_df)
+s_df = standardize_columns(s_df)
 
 # ------------------------------------------------
-# 4. Processing
+# 4. Processing & Integration
 # ------------------------------------------------
-all_names = pd.concat([a_df["agency_name"], r_df["agency_name"]]).unique()
+all_names = pd.concat([a_df["agency_name"], r_df["agency_name"], s_df["agency_name"]]).unique()
 master_map = unify_agency_names(all_names)
 
-a_df["agency_name"] = a_df["agency_name"].map(master_map)
-r_df["agency_name"] = r_df["agency_name"].map(master_map)
+for df in [a_df, r_df, s_df]:
+    df["agency_name"] = df["agency_name"].map(master_map)
+    df["city"] = df["city"].fillna("Unknown").str.strip().str.title()
 
+# Clean Scorecard Numerics
+s_df["fulfilled_val"] = s_df["fulfilled_val"].apply(clean_numeric)
+s_df["shifts_requested"] = s_df["shifts_requested"].apply(clean_numeric)
+s_df["shifts_filled"] = s_df["shifts_filled"].apply(clean_numeric)
+
+# Build Scorecard Summary
+scorecard_summary = s_df.groupby(['agency_name', 'city'], as_index=False).agg({
+    'fulfilled_val': 'mean',
+    'shifts_requested': 'sum',
+    'shifts_filled': 'sum'
+}).rename(columns={'fulfilled_val': 'avg_fulfillment'})
+
+# Build lookup for Client Names
+id_name_lookup = {}
+merged_map = pd.merge(
+    r_df[['agency_name', 'city', 'platforms.employer_id']].drop_duplicates(),
+    s_df[['agency_name', 'city', 'client_name']].drop_duplicates(),
+    on=['agency_name', 'city'], how='inner'
+)
+id_name_lookup = dict(zip(merged_map['platforms.employer_id'], merged_map['client_name']))
+
+# Combine Base Data
 combined = pd.concat([a_df, r_df], ignore_index=True)
-combined["city"] = combined["city"].fillna("Unknown").str.strip().str.title()
 combined["agency_margin"] = pd.to_numeric(combined.get("agency_margin", np.nan), errors="coerce")
 
-# Calculate city metrics
-city_avg_map = combined.groupby("city")["agency_margin"].mean().to_dict()
-combined["city_avg_margin"] = combined["city"].map(city_avg_map)
-combined["margin_vs_city_avg"] = combined["agency_margin"] - combined["city_avg_margin"]
-
-# Global aggregation for clean display
+# Aggregation logic
 agg_logic = {
     "agency_margin": "mean",
-    "city_avg_margin": "mean",
-    "margin_vs_city_avg": "mean"
+    "venue_name": lambda x: x.nunique()
 }
-optional_cols = ["role_category", "supply_capability", "platforms.employer_id", "venue_name"]
-for col in optional_cols:
+for col in ["role_category", "supply_capability", "platforms.employer_id"]:
     if col in combined.columns:
         agg_logic[col] = lambda x: ", ".join(sorted(set([str(i).strip() for i in x if pd.notna(i) and str(i).strip() != ""])))
 
 master_display_df = combined.groupby(["agency_name", "city"], as_index=False).agg(agg_logic)
+master_display_df = master_display_df.merge(scorecard_summary, on=['agency_name', 'city'], how='left')
 
-# Presence Type Calculation
-has_role = "role_category" in master_display_df.columns
-master_display_df["presence_type"] = np.where(
-    master_display_df["agency_margin"].notna() & (master_display_df["role_category"] != "" if has_role else False), 
-    "Rate Card + Coverage",
-    np.where(master_display_df["agency_margin"].notna(), "Rate Card Only", "Coverage Only")
-)
+if "platforms.employer_id" in master_display_df.columns:
+    def get_names(ids_str):
+        ids = [i.strip() for i in ids_str.split(',') if i.strip()]
+        names = [str(id_name_lookup.get(float(i) if i.replace('.','',1).isdigit() else i, i)) for i in ids]
+        return ", ".join(sorted(set(names)))
+    master_display_df["client_list"] = master_display_df["platforms.employer_id"].apply(get_names)
 
 # ------------------------------------------------
-# 5. Navigation & Filters
+# 5. Views
 # ------------------------------------------------
-st.sidebar.header("View Control")
-view = st.sidebar.radio("Mode", ["Coverage View", "Agency View", "City View", "Client View"])
-
-all_cities = sorted(master_display_df["city"].unique())
-all_agencies = sorted(master_display_df["agency_name"].unique())
-all_clients = sorted(combined["platforms.employer_id"].dropna().unique()) if "platforms.employer_id" in combined.columns else []
-
-selected_city = st.sidebar.multiselect("Filter City", ["All"] + all_cities, default=["All"])
-selected_agency = st.sidebar.multiselect("Filter Agency", ["All"] + all_agencies, default=["All"])
-selected_client = st.sidebar.selectbox("Select Client (for Client View)", ["All"] + all_clients)
+view = st.sidebar.radio("View Mode", ["Coverage View", "Agency View", "City View", "Client View"])
+cities = sorted(master_display_df["city"].unique())
+selected_city = st.sidebar.multiselect("Filter City", ["All"] + cities, default=["All"])
 
 df_filt = master_display_df.copy()
-if "All" not in selected_city: df_filt = df_filt[df_filt["city"].isin(selected_city)]
-if "All" not in selected_agency: df_filt = df_filt[df_filt["agency_name"].isin(selected_agency)]
+if "All" not in selected_city:
+    df_filt = df_filt[df_filt["city"].isin(selected_city)]
 
-# ------------------------------------------------
-# 6. Views
-# ------------------------------------------------
 if view == "Coverage View":
     st.subheader("Market Coverage Overview")
-    cols = ["agency_name", "city", "presence_type", "agency_margin", "city_avg_margin", "margin_vs_city_avg"]
-    if "role_category" in df_filt.columns: cols.append("role_category")
-    if "supply_capability" in df_filt.columns: cols.append("supply_capability")
-    st.dataframe(df_filt[cols].sort_values(["city", "agency_name"]), use_container_width=True)
+    st.dataframe(df_filt.sort_values(["city", "agency_name"]), use_container_width=True)
 
 elif view == "Agency View":
-    st.subheader("Agency Performance")
-    if len(selected_agency) != 1 or selected_agency[0] == "All":
-        st.warning("Please select one specific agency.")
-    else:
-        a_data = df_filt[df_filt["agency_name"] == selected_agency[0]]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cities", a_data["city"].nunique())
-        c2.metric("Avg Margin", round(a_data["agency_margin"].mean(), 2) if not a_data["agency_margin"].dropna().empty else "N/A")
-        c3.metric("Vs Market", round(a_data["margin_vs_city_avg"].mean(), 2) if not a_data["margin_vs_city_avg"].dropna().empty else "N/A")
-        st.dataframe(a_data.drop(columns=["agency_name"]), use_container_width=True)
+    agencies = sorted(df_filt["agency_name"].unique())
+    sel_agency = st.sidebar.selectbox("Select Agency", agencies)
+    a_data = df_filt[df_filt["agency_name"] == sel_agency]
+    
+    st.subheader(f"Agency Performance: {sel_agency}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Avg Margin", f"{round(a_data['agency_margin'].mean(), 2)}")
+    c2.metric("Avg Fulfillment", f"{round(a_data['avg_fulfillment'].mean(), 1)}%")
+    c3.metric("Total Requested", f"{int(a_data['shifts_requested'].sum()):,}")
+    c4.metric("Total Filled", f"{int(a_data['shifts_filled'].sum()):,}")
+    
+    st.dataframe(a_data[["city", "agency_margin", "avg_fulfillment", "shifts_requested", "shifts_filled", "client_list"]], use_container_width=True)
 
 elif view == "City View":
     if len(selected_city) != 1 or selected_city[0] == "All":
-        st.subheader("City Market View")
-        st.warning("Please select a single city to see detailed metrics.")
+        st.warning("Select one city for detailed metrics.")
     else:
-        city_name = selected_city[0]
-        st.subheader(f"Market Snapshot: {city_name}")
-        city_data = df_filt[df_filt["city"] == city_name]
+        c_name = selected_city[0]
+        c_data = df_filt[df_filt["city"] == c_name]
+        st.subheader(f"Market Snapshot: {c_name}")
         
-        # At-a-glance metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Avg City Margin", round(city_data["agency_margin"].mean(), 2) if not city_data["agency_margin"].dropna().empty else "N/A")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Market Fulfillment", f"{round(c_data['avg_fulfillment'].mean(), 1)}%")
+        m2.metric("Total Market Shifts", f"{int(c_data['shifts_requested'].sum()):,}")
+        m3.metric("Agencies", c_data["agency_name"].nunique())
         
-        # Calculate unique venues and clients specifically for this city
-        raw_city_data = combined[combined["city"] == city_name]
-        num_venues = raw_city_data["venue_name"].nunique() if "venue_name" in raw_city_data.columns else 0
-        clients_in_city = sorted(raw_city_data["platforms.employer_id"].dropna().unique())
-        
-        c2.metric("Number of Venues", num_venues)
-        c3.markdown(f"**Clients in Market:**\n {', '.join([str(c) for c in clients_in_city]) if clients_in_city else 'None Found'}")
-        
-        st.divider()
-        st.dataframe(city_data[["agency_name", "presence_type", "agency_margin", "role_category"]].sort_values("agency_margin"), use_container_width=True)
+        st.dataframe(c_data[["agency_name", "agency_margin", "avg_fulfillment", "shifts_requested", "shifts_filled", "client_list"]].sort_values("avg_fulfillment", ascending=False), use_container_width=True)
 
 elif view == "Client View":
-    if selected_client == "All":
-        st.subheader("Client Portfolio View")
-        st.warning("Please select a specific Client ID from the sidebar.")
-        client_pivot = master_display_df.pivot_table(index="city", columns="agency_name", values="agency_margin", aggfunc="mean").fillna("-")
-        st.dataframe(client_pivot, use_container_width=True)
-    else:
-        st.subheader(f"Client Venue Breakdown: {selected_client}")
-        # Filter combined data for specific client
-        client_data = combined[combined["platforms.employer_id"].astype(str) == str(selected_client)]
-        
-        if client_data.empty:
-            st.info("No venue or agency data found for this client ID.")
-        else:
-            # Group by venue to show supporting agencies and their margins
-            venue_breakdown = client_data.groupby(["venue_name", "city", "agency_name"], as_index=False).agg({
-                "agency_margin": "mean"
-            }).rename(columns={"agency_margin": "Avg Margin at Venue"})
-            
-            st.dataframe(venue_breakdown.sort_values(["city", "venue_name"]), use_container_width=True)
+    all_clients = sorted(id_name_lookup.values())
+    sel_client = st.sidebar.selectbox("Select Client", all_clients)
+    client_df = master_display_df[master_display_df["client_list"].str.contains(sel_client, na=False)]
+    st.subheader(f"Portfolio Support: {sel_client}")
+    st.dataframe(client_df[["city", "agency_name", "agency_margin", "avg_fulfillment", "shifts_requested", "shifts_filled"]], use_container_width=True)
 
-# Export
-st.sidebar.markdown("---")
-st.sidebar.download_button("Export Results", master_display_df.to_csv(index=False), "agency_intelligence.csv")
+st.sidebar.download_button("Export Data", master_display_df.to_csv(index=False), "agency_intelligence.csv")
