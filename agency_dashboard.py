@@ -201,16 +201,18 @@ elif view == "Agency View":
 
 elif view == "City View":
     if len(selected_city) != 1 or selected_city[0] == "All":
-        st.warning("Select one city for detailed metrics.")
+        st.warning("Please filter for exactly one city in the sidebar to see market-wide metrics.")
     else:
         c_name = selected_city[0]
         c_data = df_filt[df_filt["city"] == c_name]
         st.subheader(f"Market Snapshot: {c_name}")
         
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Market Fulfillment", f"{round(c_data['avg_fulfillment'].mean(), 1)}%")
-        m2.metric("Total Market Shifts", f"{int(c_data['shifts_requested'].sum()):,}")
-        m3.metric("Agencies", c_data["agency_name"].nunique())
+        # Market-wide Metric Header
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("City Avg Margin", f"{round(c_data['agency_margin'].mean(), 2)}")
+        m2.metric("Market Fulfillment", f"{round(c_data['avg_fulfillment'].mean(), 1)}%")
+        m3.metric("Total Market Volume", f"{int(c_data['shifts_requested'].sum()):,}")
+        m4.metric("Active Agencies", c_data["agency_name"].nunique())
         
         st.dataframe(c_data[["agency_name", "agency_margin", "avg_fulfillment", "shifts_requested", "shifts_filled", "client_list"]].sort_values("avg_fulfillment", ascending=False), use_container_width=True)
 
